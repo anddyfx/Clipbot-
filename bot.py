@@ -1,187 +1,74 @@
-import os, re, json, uuid, shutil, asyncio, subprocess, logging
-from pathlib import Path
+import re
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
-from faster_whisper import WhisperModel
-from telegram import Update
-from telegram.ext import (ApplicationBuilder, CommandHandler,
-                          MessageHandler, ContextTypes, filters)
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("clipbot")
+STOP = set("""a an the and or but if so to of in on at for with is are was were be been
+it this that these those i you he she we they me my your our their his her its
+as by from up out just like really very got get going gonna yeah okay oh um uh
+then than too not no yes do does did have has had can could would should will
+what when where who why how there here about into over after before all some
+any more most one two know think see say said make made right now well""".split())
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CLIP_MIN = int(os.getenv("CLIP_MIN", "30"))
-CLIP_MAX = int(os.getenv("CLIP_MAX", "60"))
-NUM_CLIPS = int(os.getenv("NUM_CLIPS", "3"))
-WORK = Path("/tmp/clipbot")
-WORK.mkdir(exist_ok=True)
+VIRAL_TAGS = ["#fyp", "#foryou", "#viral", "#trending"]
+GAMING_TAGS = ["#gaming", "#twitch", "#streamer", "#clips", "#gamingclips"]
 
-# small model keeps Railway memory usage low
-whisper = WhisperModel("base", device="cpu", compute_type="int8")
-
-URL_RE = re.compile(r"https?://\S+")
+# General TikTok peak windows (UTC). Best days: Tue, Thu, Fri.
+# Peak hours: late morning, early evening, and late night.
+PEAK_HOURS_UTC = [(15, "evening in the US"), (19, "prime time in the US"),
+                  (11, "lunch in Europe")]
+BEST_DAYS = {1, 3, 4}  # Mon=0 ... Sun=6 -> Tue, Thu, Fri
 
 
-def run(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True, check=True)
+def keywords(text, n=5):
+    words = re.findall(r"[a-zA-Z']{4,}", text.lower())
+    words = [w for w in words if w not in STOP]
+    return [w for w, _ in Counter(words).most_common(n)]
 
 
-def download(url, out_dir):
-    out = str(out_dir / "source.%(ext)s")
-    run(["yt-dlp", "-f", "bv*[height<=720]+ba/b[height<=720]/b",
-         "--merge-output-format", "mp4", "--no-playlist",
-         "-o", out, url])
-    return next(out_dir.glob("source.*"))
+def suggest_hashtags(text, n_keywords=5):
+    tags = ["#" + w.replace("'", "") for w in keywords(text, n_keywords)]
+    tags += GAMING_TAGS[:2] + VIRAL_TAGS[:3]
+    seen, out = set(), []
+    for t in tags:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out[:10]
 
 
-def duration(path):
-    r = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "json", str(path)])
-    return float(json.loads(r.stdout)["format"]["duration"])
-
-
-def extract_audio(video, wav):
-    run(["ffmpeg", "-y", "-i", str(video), "-vn", "-ac", "1",
-         "-ar", "16000", str(wav)])
-
-
-def loudness_curve(wav, total):
-    """RMS loudness per second, used to find hype moments."""
-    raw = subprocess.run(
-        ["ffmpeg", "-i", str(wav), "-f", "s16le", "-ac", "1",
-         "-ar", "16000", "-"], capture_output=True, check=True).stdout
-    audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
-    sr = 16000
-    secs = int(total)
-    curve = np.zeros(secs)
-    for i in range(secs):
-        chunk = audio[i * sr:(i + 1) * sr]
-        if len(chunk):
-            curve[i] = np.sqrt(np.mean(chunk ** 2))
-    return curve
-
-
-def pick_moments(curve, words_per_sec, length):
-    """Score each window by loudness + speech density, pick top non-overlapping."""
-    secs = len(curve)
-    if secs <= CLIP_MIN:
-        return [(0, secs)]
-    loud = curve / (curve.max() + 1e-9)
-    speech = words_per_sec / (words_per_sec.max() + 1e-9)
-    score = 0.6 * loud + 0.4 * speech
-    win = min(CLIP_MAX, max(CLIP_MIN, 45))
-    csum = np.concatenate([[0], np.cumsum(score)])
-    scores = [(csum[i + win] - csum[i], i) for i in range(0, secs - win + 1)]
-    scores.sort(reverse=True)
-    picked = []
-    for _, start in scores:
-        if all(abs(start - s) >= win for s, _ in picked):
-            picked.append((start, start + win))
-        if len(picked) == NUM_CLIPS:
-            break
-    return sorted(picked)
-
-
-def ts(t):
-    h, m, s = int(t // 3600), int(t % 3600 // 60), t % 60
-    return f"{h}:{m:02d}:{s:05.2f}"
-
-
-def make_ass(segments, start, end, path):
-    header = ("[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n\n"
-              "[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,"
-              "OutlineColour,BackColour,Bold,Outline,Shadow,Alignment,MarginV\n"
-              "Style: Default,Arial,64,&H00FFFFFF,&H00000000,&H64000000,"
-              "1,4,1,2,300\n\n[Events]\nFormat: Layer,Start,End,Style,Text\n")
-    lines = []
-    for seg in segments:
-        if seg.end < start or seg.start > end:
+def best_post_time(now=None):
+    """Next good posting slot, returned as a UTC datetime and a label."""
+    now = now or datetime.now(timezone.utc)
+    slots = []
+    for d in range(0, 8):
+        day = now + timedelta(days=d)
+        if day.weekday() not in BEST_DAYS:
             continue
-        s = max(seg.start, start) - start
-        e = min(seg.end, end) - start
-        text = seg.text.strip().replace("\n", " ").upper()
-        lines.append(f"Dialogue: 0,{ts(s)},{ts(e)},Default,{text}")
-    Path(path).write_text(header + "\n".join(lines), encoding="utf-8")
+        for hour, label in PEAK_HOURS_UTC:
+            t = day.replace(hour=hour, minute=0, second=0, microsecond=0)
+            if t > now + timedelta(minutes=30):
+                slots.append((t, label))
+    slots.sort()
+    return slots[0] if slots else (now + timedelta(hours=2), "soon")
 
 
-def render_clip(video, start, end, segments, out, work):
-    ass = work / f"cap_{uuid.uuid4().hex[:6]}.ass"
-    make_ass(segments, start, end, ass)
-    # vertical 9:16 with blurred background, captions burned in
-    vf = ("split[a][b];[a]scale=1080:1920,boxblur=20:5[bg];"
-          "[b]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,"
-          f"subtitles={ass}")
-    run(["ffmpeg", "-y", "-ss", str(start), "-t", str(end - start),
-         "-i", str(video), "-filter_complex", vf,
-         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-         "-c:a", "aac", "-movflags", "+faststart", str(out)])
+def viral_score(loud, speech, start, end, text, duration_total):
+    """0-100 score from energy, talk density, a strong hook and ideal length."""
+    a, b = int(start), int(end)
+    energy = float(np.mean(loud[a:b])) if b > a else 0.0
+    talk = float(np.mean(speech[a:b])) if b > a else 0.0
+    peak = float(np.max(loud[a:b])) if b > a else 0.0
+    first = " ".join(text.split()[:20]).lower()
+    hook = 1.0 if re.search(r"\?|\bwow\b|\bno way\b|\bwait\b|\bwhat\b|\bomg\b|\bcrazy\b|!", first) else 0.4
+    length = end - start
+    length_fit = 1.0 if 30 <= length <= 60 else 0.7
+    score = (0.35 * energy + 0.25 * peak + 0.2 * talk + 0.12 * hook
+             + 0.08 * length_fit)
+    return int(round(min(1.0, score * 1.25) * 100))
 
 
-def process(video, work):
-    total = duration(video)
-    wav = work / "audio.wav"
-    extract_audio(video, wav)
-    segs, _ = whisper.transcribe(str(wav), vad_filter=True)
-    segments = list(segs)
-    curve = loudness_curve(wav, total)
-    wps = np.zeros(len(curve))
-    for s in segments:
-        n = len(s.text.split())
-        span = max(1, int(s.end - s.start))
-        for t in range(int(s.start), min(int(s.end) + 1, len(wps))):
-            wps[t] += n / span
-    moments = pick_moments(curve, wps, total)
-    outs = []
-    for i, (a, b) in enumerate(moments, 1):
-        out = work / f"clip_{i}.mp4"
-        render_clip(video, a, b, segments, out, work)
-        outs.append(out)
-    return outs
-
-
-async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Send me a video or a YouTube/Twitch link and I'll clip the best "
-        "moments with captions.")
-
-
-async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    work = WORK / uuid.uuid4().hex
-    work.mkdir()
-    try:
-        await msg.reply_text("Got it, working on it. This can take a few minutes.")
-        loop = asyncio.get_running_loop()
-        if msg.video or msg.document:
-            f = await (msg.video or msg.document).get_file()
-            video = work / "source.mp4"
-            await f.download_to_drive(str(video))
-        else:
-            m = URL_RE.search(msg.text or "")
-            if not m:
-                await msg.reply_text("Send a video file or a link please.")
-                return
-            video = await loop.run_in_executor(None, download, m.group(0), work)
-        clips = await loop.run_in_executor(None, process, video, work)
-        for c in clips:
-            with open(c, "rb") as fh:
-                await msg.reply_video(fh, supports_streaming=True)
-    except Exception as e:
-        log.exception("failed")
-        await msg.reply_text(f"Something went wrong: {str(e)[:200]}")
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
-
-
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(MessageHandler(
-        filters.VIDEO | filters.Document.VIDEO | (filters.TEXT & ~filters.COMMAND),
-        handle))
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+def clip_text(segments, start, end):
+    return " ".join(s.text.strip() for s in segments
+                    if s.end >= start and s.start <= end)
