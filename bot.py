@@ -55,6 +55,11 @@ def download_url(url, folder):
         "noplaylist": True,
         "quiet": True,
     }
+    cookies = os.getenv("YT_COOKIES")
+    if cookies:
+        cpath = Path(folder) / "cookies.txt"
+        cpath.write_text(cookies)
+        opts["cookiefile"] = str(cpath)
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
     files = glob.glob(str(Path(folder) / "source.*"))
@@ -232,3 +237,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
