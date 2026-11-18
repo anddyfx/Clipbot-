@@ -30,6 +30,23 @@ VERTICAL = os.getenv("VERTICAL", "1") == "1"
 SR = 16000
 URL_RE = re.compile(r"https?://\S+")
 
+def setup_ffmpeg():
+    """Use a pip-bundled FFmpeg if the system doesn't have one."""
+    if shutil.which("ffmpeg"):
+        return
+    import imageio_ffmpeg
+    exe = imageio_ffmpeg.get_ffmpeg_exe()
+    bindir = Path(tempfile.gettempdir()) / "ffbin"
+    bindir.mkdir(exist_ok=True)
+    link = bindir / "ffmpeg"
+    if not link.exists():
+        link.symlink_to(exe)
+    os.environ["PATH"] = str(bindir) + os.pathsep + os.environ["PATH"]
+    log.info("Using bundled FFmpeg: %s", exe)
+
+
+setup_ffmpeg()
+
 _model = None
 _busy = asyncio.Semaphore(1)  # one video at a time, keeps memory low
 
@@ -237,4 +254,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
